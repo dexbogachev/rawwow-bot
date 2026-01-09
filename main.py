@@ -1,293 +1,336 @@
+import os
 import asyncio
+from typing import List, Optional
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart, Command
-from admin_kb import admin_menu
-from config import ADMIN_IDS
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-from config import load_config
-from states import OrderFlow
-from keyboards import main_menu, yes_no_ref, services_kb, SERVICES, admin_actions, upgrade_options
-from db import InMemoryDB, Order
 
-cfg = load_config()
-db = InMemoryDB()
+# ----------------------------
+# Config
+# ----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 
-SERVICE_MAP = {k: (title, credits) for (title, k, credits) in SERVICES}
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment variables")
 
-bot = Bot(token=cfg.bot_token)
+def parse_admin_ids(raw: str) -> List[int]:
+    """
+    ADMIN_IDS can be:
+      "123456789"
+      "123456789,987654321"
+      "123456789 987654321"
+    """
+    if not raw:
+        return []
+    raw = raw.replace(" ", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    ids = []
+    for p in parts:
+        if p.isdigit():
+            ids.append(int(p))
+    return ids
+
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+
+
+# ----------------------------
+# Keyboards
+# ----------------------------
+user_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🛒 Новый заказ")],
+        [KeyboardButton(text="ℹ️ Как это работает")],
+    ],
+    resize_keyboard=True
+)
+
+admin_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🧾 Заказы")],
+        [KeyboardButton(text="👤 Пользователи"), KeyboardButton(text="💳 Кредиты")],
+        [KeyboardButton(text="📢 Рассылка")],
+        [KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="⬅️ Выйти из админки")],
+    ],
+    resize_keyboard=True
+)
+
+services_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🎨 Color Only")],
+        [KeyboardButton(text="🧼 Clean Portrait")],
+        [KeyboardButton(text="🧩 Pro Retouch")],
+        [KeyboardButton(text="💄 Beauty Retouch")],
+        [KeyboardButton(text="📦 Product Retouch")],
+        [KeyboardButton(text="⬅️ Назад")],
+    ],
+    resize_keyboard=True
+)
+
+skip_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="⏭ Пропустить")],
+        [KeyboardButton(text="⬅️ Назад")],
+    ],
+    resize_keyboard=True
+)
+
+
+# ----------------------------
+# FSM (Order flow)
+# ----------------------------
+class OrderState(StatesGroup):
+    choosing_service = State()
+    waiting_photo = State()
+    waiting_comment = State()
+    waiting_reference = State()
+
+
+# ----------------------------
+# App
+# ----------------------------
 dp = Dispatcher()
 
 def is_admin(user_id: int) -> bool:
-    return user_id in cfg.admin_ids
+    return user_id in ADMIN_IDS
 
-@dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer(
-        "RawWowBot 👋\n\n"
-        "Здесь вы можете оформить заказ на ретушь:\n"
-        "1) Загрузить фото (как фото или документ)\n"
-        "2) Добавить референс (по желанию)\n"
-        "3) Написать пожелания\n"
-        "4) Выбрать услугу\n\n"
-        "Нажмите «Новый заказ».",
-        reply_markup=main_menu()
+
+async def notify_admins(text: str, bot: Bot, photo_file_id: Optional[str] = None,
+                        ref_file_id: Optional[str] = None) -> None:
+    """
+    Sends order info to all admins. Photo/reference are forwarded if provided.
+    """
+    if not ADMIN_IDS:
+        # If ADMIN_IDS isn't set, we still run, but no admin notifications.
+        return
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+            if photo_file_id:
+                await bot.send_photo(admin_id, photo_file_id, caption="📷 Фото клиента (file_id)")
+            if ref_file_id:
+                await bot.send_photo(admin_id, ref_file_id, caption="🧷 Референс (file_id)")
+        except Exception:
+            # do not crash on admin send errors
+            pass
+
+
+# ----------------------------
+# Handlers: Start / Info
+# ----------------------------
+@dp.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Привет! Это RawWow.\n\n"
+        "Выберите действие:",
+        reply_markup=user_menu
     )
+
+@dp.message(F.text == "ℹ️ Как это работает")
+async def how_it_works(message: Message):
+    await message.answer(
+        "1) Вы выбираете услугу\n"
+        "2) Отправляете фото (как фото или документ)\n"
+        "3) Пишете комментарии/пожелания\n"
+        "4) При желании добавляете референс\n\n"
+        "После этого заказ уходит ретушёру.",
+        reply_markup=user_menu
+    )
+
+
+# ----------------------------
+# Admin panel
+# ----------------------------
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
-    if message.from_user.id in ADMIN_IDS:
+    if is_admin(message.from_user.id):
         await message.answer("🔐 Админ-панель", reply_markup=admin_menu)
     else:
         await message.answer("⛔ Доступ запрещён")
-        
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("Главное меню:", reply_markup=main_menu())
-    await cb.answer()
 
-@dp.callback_query(F.data == "new_order")
-async def new_order(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(OrderFlow.waiting_photo)
-    await cb.message.edit_text(
-        "📸 Отправьте фото.\n\n"
-        "Можно:\n"
-        "• как Фото (JPEG)\n"
-        "• как Файл/Документ (RAW/TIFF/PNG/JPG)\n\n"
-        "Если несколько — отправляйте по одному (в MVP)."
+@dp.message(F.text == "⬅️ Выйти из админки")
+async def admin_exit(message: Message):
+    await message.answer("Ок, вы вышли из админки.", reply_markup=user_menu)
+
+@dp.message(F.text == "🧾 Заказы")
+async def admin_orders(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Доступ запрещён")
+    await message.answer(
+        "🧾 Заказы: пока это заглушка.\n"
+        "Следующим шагом подключим хранение заказов (в памяти/в файле/в базе) и просмотр списка."
     )
-    await cb.answer()
 
-@dp.message(OrderFlow.waiting_photo, F.photo)
-async def got_photo(msg: Message, state: FSMContext):
-    file_id = msg.photo[-1].file_id
-    await state.update_data(photo_file_id=file_id, photo_kind="photo")
-    await msg.answer("Есть референс? (пример желаемого результата)", reply_markup=yes_no_ref())
-    await state.set_state(OrderFlow.waiting_ref)
 
-@dp.message(OrderFlow.waiting_photo, F.document)
-async def got_document(msg: Message, state: FSMContext):
-    file_id = msg.document.file_id
-    await state.update_data(photo_file_id=file_id, photo_kind="document")
-    await msg.answer("Есть референс? (пример желаемого результата)", reply_markup=yes_no_ref())
-    await state.set_state(OrderFlow.waiting_ref)
+# ----------------------------
+# Order flow
+# ----------------------------
+@dp.message(F.text == "🛒 Новый заказ")
+async def new_order(message: Message, state: FSMContext):
+    await state.set_state(OrderState.choosing_service)
+    await message.answer(
+        "Выберите услугу:",
+        reply_markup=services_kb
+    )
 
-@dp.callback_query(OrderFlow.waiting_ref, F.data.in_({"ref_yes", "ref_no"}))
-async def ref_choice(cb: CallbackQuery, state: FSMContext):
-    if cb.data == "ref_yes":
-        await cb.message.edit_text("📎 Отправьте референс (фото или документ).")
-        # остаёмся в waiting_ref, но ждём файл
-    else:
-        await state.update_data(ref_file_id=None, ref_kind=None)
-        await cb.message.edit_text(
-            "✍️ Напишите пожелания к обработке.\n"
-            "Пример: «убрать прыщи, оставить текстуру кожи, выровнять тон, как на рефе»"
+@dp.message(OrderState.choosing_service, F.text.in_({
+    "🎨 Color Only", "🧼 Clean Portrait", "🧩 Pro Retouch", "💄 Beauty Retouch", "📦 Product Retouch"
+}))
+async def choose_service(message: Message, state: FSMContext):
+    await state.update_data(service=message.text)
+    await state.set_state(OrderState.waiting_photo)
+    await message.answer(
+        "Отправьте фото.\n\n"
+        "Можно как **Фото** или как **Документ** (так качество будет лучше).",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ Назад")]],
+            resize_keyboard=True
         )
-        await state.set_state(OrderFlow.waiting_comment)
-    await cb.answer()
-
-@dp.message(OrderFlow.waiting_ref, F.photo)
-async def got_ref_photo(msg: Message, state: FSMContext):
-    await state.update_data(ref_file_id=msg.photo[-1].file_id, ref_kind="photo")
-    await msg.answer(
-        "✍️ Напишите пожелания к обработке.\n"
-        "Пример: «убрать прыщи, оставить текстуру кожи, выровнять тон, как на рефе»"
     )
-    await state.set_state(OrderFlow.waiting_comment)
 
-@dp.message(OrderFlow.waiting_ref, F.document)
-async def got_ref_doc(msg: Message, state: FSMContext):
-    await state.update_data(ref_file_id=msg.document.file_id, ref_kind="document")
-    await msg.answer(
-        "✍️ Напишите пожелания к обработке.\n"
-        "Пример: «убрать прыщи, оставить текстуру кожи, выровнять тон, как на рефе»"
-    )
-    await state.set_state(OrderFlow.waiting_comment)
+@dp.message(OrderState.waiting_photo, F.text == "⬅️ Назад")
+async def back_from_photo(message: Message, state: FSMContext):
+    await state.set_state(OrderState.choosing_service)
+    await message.answer("Выберите услугу:", reply_markup=services_kb)
 
-@dp.message(OrderFlow.waiting_comment, F.text)
-async def got_comment(msg: Message, state: FSMContext):
-    await state.update_data(comment=msg.text.strip())
-    await msg.answer("Выберите тип услуги:", reply_markup=services_kb())
-    await state.set_state(OrderFlow.waiting_service)
+@dp.message(OrderState.choosing_service, F.text == "⬅️ Назад")
+async def cancel_order(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Ок, отменил. Возвращаю в меню.", reply_markup=user_menu)
 
-@dp.callback_query(OrderFlow.waiting_service, F.data.startswith("svc:"))
-async def choose_service(cb: CallbackQuery, state: FSMContext):
-    svc_key = cb.data.split(":", 1)[1]
-    if svc_key not in SERVICE_MAP:
-        await cb.answer("Неизвестная услуга", show_alert=True)
-        return
+@dp.message(OrderState.waiting_photo, F.photo)
+async def got_photo_as_photo(message: Message, state: FSMContext):
+    # Highest size is last
+    file_id = message.photo[-1].file_id
+    await state.update_data(photo_file_id=file_id, photo_type="photo")
+    await state.set_state(OrderState.waiting_comment)
+    await message.answer("Напишите комментарий/пожелания к ретуши:", reply_markup=skip_kb)
 
-    title, credits = SERVICE_MAP[svc_key]
+@dp.message(OrderState.waiting_photo, F.document)
+async def got_photo_as_document(message: Message, state: FSMContext):
+    # Document might be any file; assume it's image
+    file_id = message.document.file_id
+    await state.update_data(photo_file_id=file_id, photo_type="document", document_name=message.document.file_name)
+    await state.set_state(OrderState.waiting_comment)
+    await message.answer("Напишите комментарий/пожелания к ретуши:", reply_markup=skip_kb)
+
+@dp.message(OrderState.waiting_photo)
+async def photo_expected(message: Message):
+    await message.answer("Пожалуйста, отправьте фото (как фото или документ).")
+
+@dp.message(OrderState.waiting_comment, F.text == "⬅️ Назад")
+async def back_from_comment(message: Message, state: FSMContext):
+    await state.set_state(OrderState.waiting_photo)
+    await message.answer("Ок, вернулись. Отправьте фото снова:", reply_markup=ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="⬅️ Назад")]],
+        resize_keyboard=True
+    ))
+
+@dp.message(OrderState.waiting_comment, F.text == "⏭ Пропустить")
+async def skip_comment(message: Message, state: FSMContext):
+    await state.update_data(comment="")
+    await state.set_state(OrderState.waiting_reference)
+    await message.answer("Если есть референс — отправьте его. Если нет — нажмите «Пропустить».", reply_markup=skip_kb)
+
+@dp.message(OrderState.waiting_comment, F.text)
+async def got_comment(message: Message, state: FSMContext):
+    await state.update_data(comment=message.text)
+    await state.set_state(OrderState.waiting_reference)
+    await message.answer("Если есть референс — отправьте его. Если нет — нажмите «Пропустить».", reply_markup=skip_kb)
+
+@dp.message(OrderState.waiting_reference, F.text == "⬅️ Назад")
+async def back_from_reference(message: Message, state: FSMContext):
+    await state.set_state(OrderState.waiting_comment)
+    await message.answer("Напишите комментарий/пожелания к ретуши:", reply_markup=skip_kb)
+
+@dp.message(OrderState.waiting_reference, F.text == "⏭ Пропустить")
+async def finish_without_ref(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-
-    order_id = db.next_order_id()
-    order = Order(
-        id=order_id,
-        user_id=cb.from_user.id,
-        username=cb.from_user.username or "",
-        photo_file_id=data["photo_file_id"],
-        photo_kind=data["photo_kind"],
-        ref_file_id=data.get("ref_file_id"),
-        ref_kind=data.get("ref_kind"),
-        comment=data.get("comment", ""),
-        service=svc_key,
-        credits_cost=credits,
-        status="new",
-    )
-    db.create_order(order)
-
-    # В MVP: сразу пробуем списать кредиты, если есть. Иначе "оплата вручную"
-    user_credits = db.get_credits(order.user_id)
-    if user_credits >= credits and db.spend_credits(order.user_id, credits):
-        pay_text = f"✅ Оплачено кредитами. Списано: {credits} cr. Остаток: {db.get_credits(order.user_id)} cr."
-    else:
-        pay_text = (
-            "💳 Оплата: (MVP) пока вручную.\n"
-            "Поддержка пришлёт способ оплаты или вы подключите платежи на следующем шаге."
-        )
-
-    await cb.message.edit_text(
-        f"✅ Заказ #{order_id} создан.\n"
-        f"Услуга: {title} ({credits} cr)\n\n"
-        f"{pay_text}\n\n"
-        f"Статус: на проверке (валидация)."
-    )
     await state.clear()
-    await cb.answer()
 
-    # Уведомление админам
-    for admin_id in cfg.admin_ids:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🆕 Новый заказ #{order_id}\n"
-                f"От: @{order.username or 'без username'} (id {order.user_id})\n"
-                f"Услуга: {title} ({credits} cr)\n"
-                f"Комментарий: {order.comment[:500]}",
-                reply_markup=admin_actions(order_id)
-            )
-        except Exception:
-            pass
+    user = message.from_user
+    service = data.get("service", "—")
+    comment = data.get("comment", "")
+    photo_file_id = data.get("photo_file_id")
 
-@dp.callback_query(F.data == "credits")
-async def credits(cb: CallbackQuery):
-    bal = db.get_credits(cb.from_user.id)
-    await cb.message.edit_text(
-        f"💳 Ваш баланс: {bal} cr\n\n"
-        "В MVP кредиты можно добавить командой /add_credits (только админ).\n"
-        "Дальше подключим автоматическую оплату и подписки.",
-        reply_markup=main_menu()
+    text = (
+        "🆕 Новый заказ\n"
+        f"👤 Клиент: {user.full_name} (@{user.username or '—'})\n"
+        f"🆔 ID: {user.id}\n"
+        f"🛠 Услуга: {service}\n"
+        f"💬 Комментарий: {comment or '—'}\n"
+        f"📎 Референс: —\n"
     )
-    await cb.answer()
 
-@dp.callback_query(F.data == "support")
-async def support(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "🆘 Поддержка\n\n"
-        "Напишите сюда вопрос и обязательно укажите номер заказа.\n"
-        "Если вопрос про оплату — тоже номер заказа.\n\n"
-        "В прод-версии эта кнопка будет вести в отдельный чат/контакт.",
-        reply_markup=main_menu()
+    await notify_admins(text, bot, photo_file_id=photo_file_id, ref_file_id=None)
+    await message.answer("✅ Заказ принят! Мы скоро свяжемся/приступим к работе.", reply_markup=user_menu)
+
+@dp.message(OrderState.waiting_reference, F.photo)
+async def finish_with_ref_photo(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    user = message.from_user
+
+    ref_file_id = message.photo[-1].file_id
+    service = data.get("service", "—")
+    comment = data.get("comment", "")
+    photo_file_id = data.get("photo_file_id")
+
+    text = (
+        "🆕 Новый заказ\n"
+        f"👤 Клиент: {user.full_name} (@{user.username or '—'})\n"
+        f"🆔 ID: {user.id}\n"
+        f"🛠 Услуга: {service}\n"
+        f"💬 Комментарий: {comment or '—'}\n"
+        f"📎 Референс: ✅\n"
     )
-    await cb.answer()
 
-# --- Админка ---
-@dp.callback_query(F.data.startswith("adm:"))
-async def admin_router(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
+    await state.clear()
+    await notify_admins(text, bot, photo_file_id=photo_file_id, ref_file_id=ref_file_id)
+    await message.answer("✅ Заказ принят! Спасибо.", reply_markup=user_menu)
 
-    parts = cb.data.split(":")
-    action = parts[1]
+@dp.message(OrderState.waiting_reference, F.document)
+async def finish_with_ref_doc(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    user = message.from_user
 
-    if action == "accept":
-        order_id = int(parts[2])
-        db.set_status(order_id, "accepted")
-        order = db.get_order(order_id)
-        await cb.message.edit_text(f"✅ Заказ #{order_id} принят в работу.")
-        await cb.answer("OK")
-        if order:
-            await bot.send_message(order.user_id, f"✅ Ваш заказ #{order_id} принят в работу. Скоро пришлём результат.")
-        return
+    ref_file_id = message.document.file_id
+    service = data.get("service", "—")
+    comment = data.get("comment", "")
+    photo_file_id = data.get("photo_file_id")
 
-    if action == "reject":
-        order_id = int(parts[2])
-        db.set_status(order_id, "rejected")
-        order = db.get_order(order_id)
-        await cb.message.edit_text(f"❌ Заказ #{order_id} отклонён. (Нужно уточнение/неподходящий формат)")
-        await cb.answer("OK")
-        if order:
-            await bot.send_message(order.user_id, f"❌ Ваш заказ #{order_id} отклонён. Напишите в поддержку с номером заказа.")
-        return
+    text = (
+        "🆕 Новый заказ\n"
+        f"👤 Клиент: {user.full_name} (@{user.username or '—'})\n"
+        f"🆔 ID: {user.id}\n"
+        f"🛠 Услуга: {service}\n"
+        f"💬 Комментарий: {comment or '—'}\n"
+        f"📎 Референс: ✅ (документ)\n"
+    )
 
-    if action == "upgrade":
-        order_id = int(parts[2])
-        await cb.message.edit_text(f"⬆️ Апгрейд заказа #{order_id}: выберите новый тип", reply_markup=upgrade_options(order_id))
-        await cb.answer("OK")
-        return
+    await state.clear()
+    # For reference as document we still try send as photo; if Telegram can't show, it'll fail silently
+    await notify_admins(text, bot, photo_file_id=photo_file_id, ref_file_id=ref_file_id)
+    await message.answer("✅ Заказ принят! Спасибо.", reply_markup=user_menu)
 
-    if action == "upg_to":
-        new_svc = parts[2]
-        order_id = int(parts[3])
-        order = db.get_order(order_id)
-        if not order:
-            await cb.answer("Заказ не найден", show_alert=True)
-            return
 
-        old_cost = order.credits_cost
-        new_title, new_cost = SERVICE_MAP.get(new_svc, ("", 0))
-        diff = max(0, new_cost - old_cost)
-
-        order.service = new_svc
-        order.credits_cost = new_cost
-        db.set_status(order_id, "upgrade", note=f"Upgrade to {new_svc}")
-
-        await cb.message.edit_text(
-            f"⬆️ Заказ #{order_id} требует апгрейда.\n"
-            f"Новая услуга: {new_title} ({new_cost} cr)\n"
-            f"Доплата: {diff} cr\n\n"
-            f"Клиенту отправлено уведомление."
-        )
-        await cb.answer("OK")
-
-        await bot.send_message(
-            order.user_id,
-            f"⬆️ Ваш заказ #{order_id} требует апгрейда тарифа.\n"
-            f"Новая услуга: {new_title} ({new_cost} cr)\n"
-            f"Нужно доплатить: {diff} cr.\n\n"
-            f"Ответьте в поддержку с номером заказа — вам пришлём ссылку на оплату/варианты."
-        )
-        return
-
-    if action == "upg_cancel":
-        order_id = int(parts[2])
-        await cb.message.edit_text(f"Отменено. Заказ #{order_id} без изменений.")
-        await cb.answer("OK")
-        return
-
-@dp.message(Command("add_credits"))
-async def add_credits_cmd(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    # /add_credits user_id amount
-    parts = msg.text.strip().split()
-    if len(parts) != 3:
-        await msg.answer("Формат: /add_credits user_id amount")
-        return
-    user_id = int(parts[1])
-    amount = int(parts[2])
-    new_bal = db.add_credits(user_id, amount)
-    await msg.answer(f"✅ Начислено {amount} cr пользователю {user_id}. Баланс: {new_bal} cr.")
-    try:
-        await bot.send_message(user_id, f"💳 Вам начислено {amount} кредитов. Баланс: {new_bal} cr.")
-    except Exception:
-        pass
-
+# ----------------------------
+# Entrypoint
+# ----------------------------
 async def main():
+    bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
