@@ -2,6 +2,8 @@ import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
+from admin_kb import admin_menu
+from config import ADMIN_IDS
 from aiogram.fsm.context import FSMContext
 
 from config import load_config
@@ -32,7 +34,13 @@ async def start(msg: Message):
         "Нажмите «Новый заказ».",
         reply_markup=main_menu()
     )
-
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("🔐 Админ-панель", reply_markup=admin_menu)
+    else:
+        await message.answer("⛔ Доступ запрещён")
+        
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -282,3 +290,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
